@@ -27,6 +27,9 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
+		/* Fallback for plat_time_init() if the CPU clock is unavailable. */
+		frequency = <900000000>;
+
 		cpu@0 {
 			compatible = "mti,interaptiv";
 			device_type = "cpu";
@@ -84,7 +87,7 @@
 		};
 	};
 
-	soc: soc {
+	soc: soc@18000000 {
 		compatible = "simple-bus";
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -106,6 +109,45 @@
 			compatible = "realtek,rtl9301-ecc";
 			reg = <0x1a600 0x54>;
 
+			status = "disabled";
+		};
+
+		gmac0: ethernet@12000 {
+			compatible = "realtek,rtl8198d-gmac", "realtek,rtl9607-gmac";
+			reg = <0x12000 0x2000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 36 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_LXB>;
+			/* BSP_IP_SEL bit 1 gates the GMAC0 IP clock */
+			resets = <&ip_en_rst 1>;
+			/*
+			 * The switch-core PHY/port bring-up is owned by the DSA
+			 * switch driver (rtl960x_dsa), which references
+			 * &switchcore from the board "switch0" node. The GMAC's
+			 * own switch_init is left inert (no phandle here).
+			 */
+			status = "disabled";
+		};
+
+		gmac1: ethernet@14000 {
+			compatible = "realtek,rtl8198d-gmac", "realtek,rtl9607-gmac";
+			reg = <0x14000 0x2000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 38 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_LXB>;
+			/* NEW_BSP_IP_SEL bit 19 gates the GMAC1 IP clock */
+			resets = <&ip_en_rst1 19>;
+			status = "disabled";
+		};
+
+		gmac2: ethernet@16000 {
+			compatible = "realtek,rtl8198d-gmac", "realtek,rtl9607-gmac";
+			reg = <0x16000 0x2000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 40 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_LXB>;
+			/* NEW_BSP_IP_SEL bit 20 gates the GMAC2 IP clock */
+			resets = <&ip_en_rst1 20>;
 			status = "disabled";
 		};
 
@@ -204,7 +246,6 @@
 			clocks = <&ccu CLK_LXB>;
 
 			interrupt-parent = <&gic>;
-			#interrupt-cells = <3>;
 			interrupts = <GIC_SHARED 23 IRQ_TYPE_LEVEL_HIGH>;
 
 			reg-io-width = <1>;
@@ -220,7 +261,6 @@
 			clocks = <&ccu CLK_LXB>;
 
 			interrupt-parent = <&gic>;
-			#interrupt-cells = <3>;
 			interrupts = <GIC_SHARED 24 IRQ_TYPE_LEVEL_HIGH>;
 
 			reg-io-width = <1>;
@@ -240,7 +280,7 @@
 		clock-frequency = <62500000>;
 	};
 
-	switchcore@1b000000 {
+	switchcore: switchcore@1b000000 {
 		compatible = "syscon", "simple-mfd";
 		reg = <0x1b000000 0x1000000>;
 		#address-cells = <1>;
