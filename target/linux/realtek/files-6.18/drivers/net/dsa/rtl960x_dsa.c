@@ -29,6 +29,7 @@
 #include <linux/phylink.h>
 #include <linux/platform_device.h>
 #include <net/dsa.h>
+#include <net/switchdev.h>
 
 /* Switch ports: 0..3 = user (LAN/WAN), 9/10 = CPU (GMAC0/GMAC1). */
 #define RTL960X_NUM_PORTS	11
@@ -92,6 +93,58 @@
 #define SW_FLUSH_DYNAMIC	BIT(4)
 #define SW_FLUSH_TIMEOUT_US	100000
 
+/*
+ * VLAN. The switch is kept VLAN-aware at all times with a transparent default
+ * VLAN (all ports member + untagged, per-port PVID = default), and per-port
+ * ingress filtering toggled by DSA's port_vlan_filtering -- the same model as
+ * the rtl83xx DSA driver. Egress tag/untag follows the per-VID untag mask
+ * (egress mode "original"). All offsets/fields from the RTL9607C SDK.
+ *
+ * The 4K VLAN table is reached through the shared indirect table engine
+ * (TBL_ACCESS_*): write the data word(s), then a CTRL word carrying the entry
+ * address, command (read/write) and table type, and poll the STS busy flag.
+ * The VLAN entry is a single 32-bit word: member mask [10:0], untag mask
+ * [21:11] (ports 0..10), FID/MSTI [23:22], ...
+ */
+#define SW_TBL_CTRL		0x12000
+#define SW_TBL_STS		0x12004
+#define SW_TBL_WR_DATA0		0x12008		/* word 0 (datareg_num = 1 for VLAN) */
+#define SW_TBL_RD_DATA0		0x1201C
+#define TBL_CTRL_ADDR(v)	(((v) & 0xfff) << 12)
+#define TBL_CTRL_CMD_WRITE	(1 << 3)	/* CMD_TYPE = write */
+#define TBL_CTRL_TYPE_VLAN	1		/* TBL_TYPE for the 4K VLAN table */
+#define TBL_STS_BUSY		BIT(13)
+#define TBL_TIMEOUT_US		10000
+
+#define VLAN_MBR_MASK		0x7ff		/* ports 0..10 */
+#define VLAN_UNTAG_SHIFT	11
+
+#define SW_VLAN_ACCEPT		0x13000		/* 2 bits/port, 0 = accept all */
+#define SW_VLAN_INGRESS		0x13004		/* 1 bit/port, ingress filtering */
+#define SW_VLAN_CTRL		0x13008
+#define SW_VLAN_CTRL_EN		BIT(0)		/* global VLAN_FILTERING enable */
+#define SW_VLAN_PB_VID		0x1300C		/* per-port PVID, 12 bits, 2 ports/word */
+#define SW_VLAN_PVID_BITS	12
+#define SW_VLAN_PVID_MASK	0xfff
+#define SW_VLAN_EGR_TAG(p)	(0x2A000 + (p) * 4)	/* bits [1:0] = egress mode */
+#define SW_VLAN_EGR_MODE_ORI	0		/* tag/untag per the VID untag mask */
+#define RTL960X_DEFAULT_VID	1
+#define RTL960X_NUM_VLANS	4096
+
+/*
+ * Per-port standalone VLAN. A standalone (non-bridged) user port must exchange
+ * untagged frames with the CPU: the rtl_otto tagger carries the source port in
+ * the descriptor trailer, not in an 802.1Q tag, and an L3 netdev on the port
+ * cannot handle a VLAN tag. But the CPU port has to be a *tagged* member of any
+ * VLAN-aware bridge's VLANs (so the per-port netdev can demux them), and a
+ * single CPU untag bit per VID cannot satisfy both. Give each standalone port
+ * its own reserved VID with the CPU as an untagged member, used as the port's
+ * PVID, so its untagged traffic reaches the CPU untagged without colliding with
+ * the bridge VLANs (which keep the CPU tagged). Bridge join/leave switches the
+ * port between this VID and the bridge-managed VLANs.
+ */
+#define RTL960X_STANDALONE_VID(p)	(RTL960X_NUM_VLANS - RTL960X_NUM_PORTS + (p))
+
 /* MDIO command/status fields in SW_PHY_CMD / SW_PHY_STS. */
 #define MDIO_CMD_READ		(1 << 21)
 #define MDIO_CMD_WRITE		(3 << 21)
@@ -110,6 +163,7 @@ struct rtl960x_dsa {
 	struct device *dev;
 	void __iomem *sw;		/* switch-core register window */
 	struct mii_bus *mbus;
+	u16 pvid[RTL960X_NUM_PORTS];	/* shadow of each port's PVID */
 };
 
 /*
@@ -354,6 +408,234 @@ static void rtl960x_dsa_port_stp_state_set(struct dsa_switch *ds, int port,
 	__raw_writel(v, priv->sw + SW_MSTI_CTRL(port));
 }
 
+/* Indirect VLAN-table access through the shared TBL_ACCESS engine. */
+static int rtl960x_vlan_tbl_wait(struct rtl960x_dsa *priv)
+{
+	int i;
+
+	for (i = 0; i < TBL_TIMEOUT_US; i++) {
+		if (!(__raw_readl(priv->sw + SW_TBL_STS) & TBL_STS_BUSY))
+			return 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int rtl960x_vlan_tbl_write(struct rtl960x_dsa *priv, u16 vid, u32 word)
+{
+	__raw_writel(word, priv->sw + SW_TBL_WR_DATA0);
+	__raw_writel(TBL_CTRL_ADDR(vid) | TBL_CTRL_CMD_WRITE | TBL_CTRL_TYPE_VLAN,
+		     priv->sw + SW_TBL_CTRL);
+	return rtl960x_vlan_tbl_wait(priv);
+}
+
+static int rtl960x_vlan_tbl_read(struct rtl960x_dsa *priv, u16 vid, u32 *word)
+{
+	int ret;
+
+	__raw_writel(TBL_CTRL_ADDR(vid) | TBL_CTRL_TYPE_VLAN,
+		     priv->sw + SW_TBL_CTRL);
+	ret = rtl960x_vlan_tbl_wait(priv);
+	if (ret)
+		return ret;
+
+	*word = __raw_readl(priv->sw + SW_TBL_RD_DATA0);
+	return 0;
+}
+
+/* Replace a VID's member and untagged port masks. */
+static int rtl960x_vlan_set_masks(struct rtl960x_dsa *priv, u16 vid,
+				  u32 member, u32 untag)
+{
+	u32 word = (member & VLAN_MBR_MASK) |
+		   ((untag & VLAN_MBR_MASK) << VLAN_UNTAG_SHIFT);
+
+	return rtl960x_vlan_tbl_write(priv, vid, word);
+}
+
+static int rtl960x_vlan_get_masks(struct rtl960x_dsa *priv, u16 vid,
+				  u32 *member, u32 *untag)
+{
+	u32 word;
+	int ret;
+
+	ret = rtl960x_vlan_tbl_read(priv, vid, &word);
+	if (ret)
+		return ret;
+
+	*member = word & VLAN_MBR_MASK;
+	*untag = (word >> VLAN_UNTAG_SHIFT) & VLAN_MBR_MASK;
+	return 0;
+}
+
+static void rtl960x_set_pvid(struct rtl960x_dsa *priv, int port, u16 vid)
+{
+	u32 off = SW_VLAN_PB_VID + (port / 2) * 4;
+	u32 shift = (port % 2) * SW_VLAN_PVID_BITS;
+	u32 v;
+
+	v = __raw_readl(priv->sw + off);
+	v &= ~(SW_VLAN_PVID_MASK << shift);
+	v |= (vid & SW_VLAN_PVID_MASK) << shift;
+	__raw_writel(v, priv->sw + off);
+
+	priv->pvid[port] = vid;
+}
+
+/*
+ * Bring the VLAN engine up with a transparent default: every port is an
+ * untagged member of the default VLAN with that VID as its PVID and ingress
+ * filtering off, so until DSA programs real VLANs the switch forwards exactly
+ * as in the VLAN-unaware case (forwarding is still gated by the bridge/PISO
+ * isolation masks). DSA then drives per-port filtering and membership.
+ */
+static void rtl960x_vlan_setup(struct dsa_switch *ds)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	u32 all = 0;
+	int p, v;
+
+	for (p = 0; p < ds->num_ports; p++)
+		if (dsa_is_user_port(ds, p) || dsa_is_cpu_port(ds, p))
+			all |= BIT(p);
+
+	/*
+	 * Unconfigured VLAN entries power on with every port as a member (flat
+	 * forwarding). Clear them so a VID only reaches ports DSA explicitly
+	 * adds; otherwise port_vlan_add's read-modify-write would keep the
+	 * all-ones default and never isolate VLANs.
+	 */
+	for (v = 1; v < RTL960X_NUM_VLANS; v++)
+		rtl960x_vlan_set_masks(priv, v, 0, 0);
+
+	rtl960x_vlan_set_masks(priv, RTL960X_DEFAULT_VID, all, all);
+
+	/* No ingress filtering yet; egress follows the per-VID untag mask. */
+	__raw_writel(0, priv->sw + SW_VLAN_INGRESS);
+	for (p = 0; p < ds->num_ports; p++) {
+		if (!dsa_is_user_port(ds, p) && !dsa_is_cpu_port(ds, p))
+			continue;
+		__raw_writel(SW_VLAN_EGR_MODE_ORI, priv->sw + SW_VLAN_EGR_TAG(p));
+		rtl960x_set_pvid(priv, p, RTL960X_DEFAULT_VID);
+	}
+
+	__raw_writel(__raw_readl(priv->sw + SW_VLAN_CTRL) | SW_VLAN_CTRL_EN,
+		     priv->sw + SW_VLAN_CTRL);
+}
+
+/*
+ * Put a user port into standalone mode: program its reserved per-port VID with
+ * the port and the CPU port as untagged members, and make it the port's PVID.
+ * Untagged ingress is then tagged internally with this VID and egresses the CPU
+ * untagged, so an L3 netdev on the port sees plain (untagged) frames.
+ */
+static void rtl960x_port_setup_standalone(struct dsa_switch *ds, int port)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	u16 vid = RTL960X_STANDALONE_VID(port);
+	u32 mask = BIT(port) | BIT(RTL960X_CPU_PORT);
+
+	rtl960x_vlan_set_masks(priv, vid, mask, mask);
+	rtl960x_set_pvid(priv, port, vid);
+}
+
+static int rtl960x_dsa_port_vlan_filtering(struct dsa_switch *ds, int port,
+					   bool vlan_filtering,
+					   struct netlink_ext_ack *extack)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	u32 v;
+
+	/*
+	 * Toggle per-port ingress VLAN filtering. The CPU port is left
+	 * unfiltered so CPU-bound and CPU-injected frames are never dropped.
+	 */
+	if (dsa_is_cpu_port(ds, port))
+		return 0;
+
+	v = __raw_readl(priv->sw + SW_VLAN_INGRESS);
+	if (vlan_filtering)
+		v |= BIT(port);
+	else
+		v &= ~BIT(port);
+	__raw_writel(v, priv->sw + SW_VLAN_INGRESS);
+
+	return 0;
+}
+
+static int rtl960x_dsa_port_vlan_add(struct dsa_switch *ds, int port,
+				     const struct switchdev_obj_port_vlan *vlan,
+				     struct netlink_ext_ack *extack)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
+	u32 member, untag;
+	int ret;
+
+	if (!vlan->vid)
+		return 0;
+
+	ret = rtl960x_vlan_get_masks(priv, vlan->vid, &member, &untag);
+	if (ret)
+		return ret;
+
+	member |= BIT(port);
+	if (untagged)
+		untag |= BIT(port);
+	else
+		untag &= ~BIT(port);
+
+	/*
+	 * This kernel has no separate host-VLAN callback, so keep the CPU port
+	 * a (tagged) member of every VLAN that has user members, so VLAN traffic
+	 * destined to the CPU (the bridge / routing) is forwarded there.
+	 */
+	member |= BIT(RTL960X_CPU_PORT);
+
+	ret = rtl960x_vlan_set_masks(priv, vlan->vid, member, untag);
+	if (ret)
+		return ret;
+
+	/* The CPU port keeps the default PVID (tagging is driven by DSA). */
+	if (!dsa_is_cpu_port(ds, port) && pvid)
+		rtl960x_set_pvid(priv, port, vlan->vid);
+
+	return 0;
+}
+
+static int rtl960x_dsa_port_vlan_del(struct dsa_switch *ds, int port,
+				     const struct switchdev_obj_port_vlan *vlan)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	u32 member, untag;
+	int ret;
+
+	if (!vlan->vid)
+		return 0;
+
+	ret = rtl960x_vlan_get_masks(priv, vlan->vid, &member, &untag);
+	if (ret)
+		return ret;
+
+	member &= ~BIT(port);
+	untag &= ~BIT(port);
+
+	/* Drop the CPU port once the VLAN has no user members left. */
+	if (!(member & ~BIT(RTL960X_CPU_PORT)))
+		member &= ~BIT(RTL960X_CPU_PORT);
+
+	ret = rtl960x_vlan_set_masks(priv, vlan->vid, member, untag);
+	if (ret)
+		return ret;
+
+	/* Removing the port's current PVID falls back to the default VLAN. */
+	if (!dsa_is_cpu_port(ds, port) && priv->pvid[port] == vlan->vid)
+		rtl960x_set_pvid(priv, port, RTL960X_DEFAULT_VID);
+
+	return 0;
+}
+
 static enum dsa_tag_protocol rtl960x_dsa_get_tag_protocol(struct dsa_switch *ds,
 							  int port,
 							  enum dsa_tag_protocol mp)
@@ -364,7 +646,7 @@ static enum dsa_tag_protocol rtl960x_dsa_get_tag_protocol(struct dsa_switch *ds,
 static int rtl960x_dsa_setup(struct dsa_switch *ds)
 {
 	struct rtl960x_dsa *priv = ds->priv;
-	int ret;
+	int ret, p;
 
 	/*
 	 * Bring up the switch-core PHYs/ports before registering the MDIO bus:
@@ -377,6 +659,17 @@ static int rtl960x_dsa_setup(struct dsa_switch *ds)
 	/* No bridges yet: every user port starts isolated (CPU-only). */
 	rtl960x_recalc_isolation(ds);
 	dev_info(priv->dev, "port isolation initialised (HW bridge offload)\n");
+
+	/* VLAN-aware with a transparent default VLAN (see rtl960x_vlan_setup). */
+	rtl960x_vlan_setup(ds);
+
+	/* Every user port starts standalone: untagged traffic to/from the CPU. */
+	for (p = 0; p < ds->num_ports; p++)
+		if (dsa_is_user_port(ds, p))
+			rtl960x_port_setup_standalone(ds, p);
+
+	/* Program VLANs even before a bridge turns on VLAN filtering. */
+	ds->configure_vlan_while_not_filtering = true;
 
 	return rtl960x_mdio_register(priv);
 }
@@ -397,6 +690,9 @@ static void rtl960x_dsa_port_bridge_leave(struct dsa_switch *ds, int port,
 {
 	/* The port is already unbridged here; reflect the new membership. */
 	rtl960x_recalc_isolation(ds);
+
+	/* Back to standalone: untagged exchange with the CPU on its own VID. */
+	rtl960x_port_setup_standalone(ds, port);
 }
 
 static void rtl960x_dsa_phylink_get_caps(struct dsa_switch *ds, int port,
@@ -449,6 +745,9 @@ static const struct dsa_switch_ops rtl960x_dsa_ops = {
 	.port_bridge_leave	= rtl960x_dsa_port_bridge_leave,
 	.port_stp_state_set	= rtl960x_dsa_port_stp_state_set,
 	.port_fast_age		= rtl960x_dsa_port_fast_age,
+	.port_vlan_filtering	= rtl960x_dsa_port_vlan_filtering,
+	.port_vlan_add		= rtl960x_dsa_port_vlan_add,
+	.port_vlan_del		= rtl960x_dsa_port_vlan_del,
 };
 
 static int rtl960x_dsa_probe(struct platform_device *pdev)
