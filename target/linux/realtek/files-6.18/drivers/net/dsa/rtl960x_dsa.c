@@ -19,6 +19,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/if_bridge.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -62,6 +63,34 @@
  */
 #define SW_PISO_PORT(p)		(0x27000 + (p) * 4)
 #define SW_PISO_PORTMASK	0x7ff
+
+/*
+ * Per-port spanning-tree state. MSTI_CTRL is a per-port 32-bit register holding
+ * four 2-bit MSTI states; for single (C)STP we only use MSTI 0 (bits [1:0]).
+ * Same global LUT/STP register block as LUT_SYS_LRN_LIMITNO @ 0x17038.
+ * (RTL9607C SDK: RTL9607C_MSTI_CTRLr @ 0x1704C, stride 4, field STATE lsp 0 len 2,
+ * array index = msti.) State values match rtk_stp_state_t.
+ */
+#define SW_MSTI_CTRL(p)		(0x1704C + (p) * 4)
+#define SW_MSTI0_STATE_MASK	0x3
+#define SW_STP_DISABLED		0
+#define SW_STP_BLOCKING		1
+#define SW_STP_LEARNING		2
+#define SW_STP_FORWARDING	3
+
+/*
+ * L2 FDB flush. FLUSH_CTRL selects what to flush; writing the per-port bit in
+ * FLUSH_EN starts the flush; FLUSH_STATUS (bit 0 of FLUSH_CTRL) reads back busy.
+ * (RTL9607C SDK: L2_TBL_FLUSH_CTRL @ 0x17044, L2_TBL_FLUSH_EN @ 0x17048 where
+ * each port maps to one bit; flush mode 0 = per-port, bit3 static, bit4 dynamic.)
+ */
+#define SW_L2_FLUSH_CTRL	0x17044
+#define SW_L2_FLUSH_EN		0x17048
+#define SW_FLUSH_STATUS_BUSY	BIT(0)
+#define SW_FLUSH_MODE_PORT	(0 << 1)
+#define SW_FLUSH_STATIC		BIT(3)
+#define SW_FLUSH_DYNAMIC	BIT(4)
+#define SW_FLUSH_TIMEOUT_US	100000
 
 /* MDIO command/status fields in SW_PHY_CMD / SW_PHY_STS. */
 #define MDIO_CMD_READ		(1 << 21)
@@ -276,6 +305,55 @@ static void rtl960x_recalc_isolation(struct dsa_switch *ds)
 	}
 }
 
+/* Flush dynamically-learned L2 entries on a port (STP topology change). */
+static void rtl960x_dsa_port_fast_age(struct dsa_switch *ds, int port)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	int i;
+
+	__raw_writel(SW_FLUSH_MODE_PORT | SW_FLUSH_DYNAMIC,
+		     priv->sw + SW_L2_FLUSH_CTRL);
+	__raw_writel(BIT(port), priv->sw + SW_L2_FLUSH_EN);
+
+	for (i = 0; i < SW_FLUSH_TIMEOUT_US; i += 10) {
+		if (!(__raw_readl(priv->sw + SW_L2_FLUSH_CTRL) &
+		      SW_FLUSH_STATUS_BUSY))
+			return;
+		udelay(10);
+	}
+
+	dev_warn(priv->dev, "L2 flush timed out on port %d\n", port);
+}
+
+static void rtl960x_dsa_port_stp_state_set(struct dsa_switch *ds, int port,
+					   u8 state)
+{
+	struct rtl960x_dsa *priv = ds->priv;
+	u32 hw, v;
+
+	switch (state) {
+	case BR_STATE_DISABLED:
+		hw = SW_STP_DISABLED;
+		break;
+	case BR_STATE_BLOCKING:
+	case BR_STATE_LISTENING:
+		hw = SW_STP_BLOCKING;
+		break;
+	case BR_STATE_LEARNING:
+		hw = SW_STP_LEARNING;
+		break;
+	case BR_STATE_FORWARDING:
+		hw = SW_STP_FORWARDING;
+		break;
+	default:
+		return;
+	}
+
+	v = __raw_readl(priv->sw + SW_MSTI_CTRL(port));
+	v = (v & ~SW_MSTI0_STATE_MASK) | hw;
+	__raw_writel(v, priv->sw + SW_MSTI_CTRL(port));
+}
+
 static enum dsa_tag_protocol rtl960x_dsa_get_tag_protocol(struct dsa_switch *ds,
 							  int port,
 							  enum dsa_tag_protocol mp)
@@ -369,6 +447,8 @@ static const struct dsa_switch_ops rtl960x_dsa_ops = {
 	.phylink_get_caps	= rtl960x_dsa_phylink_get_caps,
 	.port_bridge_join	= rtl960x_dsa_port_bridge_join,
 	.port_bridge_leave	= rtl960x_dsa_port_bridge_leave,
+	.port_stp_state_set	= rtl960x_dsa_port_stp_state_set,
+	.port_fast_age		= rtl960x_dsa_port_fast_age,
 };
 
 static int rtl960x_dsa_probe(struct platform_device *pdev)
