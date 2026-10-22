@@ -16,6 +16,8 @@ define Build/hasivo-stock-patch
 endef
 
 DEVICE_VARS += \
+	BUFFALO_LUNA_PRODUCT \
+	BUFFALO_LUNA_VERSION \
 	BELKIN_HEADER \
 	BELKIN_MODEL \
         CAMEO_BOARD_MODEL \
@@ -173,6 +175,20 @@ define Device/Default
 	pad-rootfs | \
 	check-size | \
 	append-metadata
+endef
+
+# Firmware image for the web updater of Buffalo routers on the Realtek
+# "luna" SDK: a header and a tar archive carrying the installer script,
+# see scripts/buffalo-luna-image.py and buffalo-luna-fwu.sh.
+define Build/buffalo-luna-image
+	$(TOPDIR)/scripts/buffalo-luna-image.py \
+		--kernel $(IMAGE_KERNEL) \
+		--rootfs $@ \
+		--script $(TOPDIR)/target/linux/realtek/image/buffalo-luna-fwu.sh \
+		--product $(BUFFALO_LUNA_PRODUCT) \
+		--version $(BUFFALO_LUNA_VERSION) \
+		--output $@.new
+	mv $@.new $@
 endef
 
 define Device/kernel-lzma
