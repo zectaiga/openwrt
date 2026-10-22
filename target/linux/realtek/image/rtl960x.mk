@@ -20,6 +20,10 @@ define Device/buffalo_wsr-1500ax2s
   KERNEL_SIZE := 6144k
   $(Device/kernel-lzma)
   KERNEL := $$(KERNEL) | check-size $$(KERNEL_SIZE)
+  BUFFALO_LUNA_PRODUCT := WRTT-363AX
+  BUFFALO_LUNA_VERSION := 999
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-rootfs | pad-rootfs | buffalo-luna-image
   IMAGE/sysupgrade.bin := append-rootfs | pad-rootfs | sysupgrade-tar rootfs=$$$$@ | append-metadata
 endef
 TARGET_DEVICES += buffalo_wsr-1500ax2s
